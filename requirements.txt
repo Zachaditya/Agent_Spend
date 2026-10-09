@@ -1,0 +1,9 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+mcp>=2.3,<3
+mcp-types>=2.3,<3
+pydantic>=2.12,<3
+cdp-sdk>=1.47,<2
+web3>=7,<8
+httpx>=0.28,<1
+python-dotenv>=1,<2
