@@ -27,8 +27,12 @@ def test_reset_database_wipes_demo_state_without_exposing_a_tool(database: Datab
     )
     database.insert_funding_event(ADDRESS, 2500, "0", status="CONFIRMED")
 
+    database.upsert_offer("0591439009", 1500, False, 500, "2099-01-01T00:00:00+00:00")
+
     result = reset_database(database.path)
 
+    assert result["offer_rows_deleted"] == 1
+    assert database.get_offer("0591439009") is None
     assert result["wallet_rows_deleted"] == 1
     assert result["policy_rows_deleted"] == 1
     assert result["purchase_rows_deleted"] == 1

@@ -48,6 +48,8 @@ class Settings:
     usdc_contract_address: str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
     merchant_address: str = "0xa7BD909D765d9e93f75a0d76E77827a6EdC8A69D"
     treasury_account_name: str = "agent-spend-treasury"
+    escrow_account_name: str = "offer-escrow"
+    escrow_eth: Decimal = Decimal("0.0002")
     starter_usdc: Decimal = Decimal("25")
     starter_eth: Decimal = Decimal("0.0005")
     max_funding_usdc: Decimal = Decimal("100")
@@ -112,6 +114,12 @@ class Settings:
         object.__setattr__(
             self, "starter_eth", _positive_decimal("STARTER_ETH", self.starter_eth, 18)
         )
+        object.__setattr__(self, "escrow_eth", _positive_decimal("ESCROW_ETH", self.escrow_eth, 18))
+        if (
+            not self.escrow_account_name.strip()
+            or self.escrow_account_name == self.treasury_account_name
+        ):
+            raise ValueError("ESCROW_ACCOUNT_NAME must name a separate escrow account")
         for name in ("max_funding_usdc", "max_total_funding_usdc"):
             object.__setattr__(self, name, _positive_decimal(name.upper(), getattr(self, name), 2))
         if self.starter_usdc > min(self.max_funding_usdc, self.max_total_funding_usdc):

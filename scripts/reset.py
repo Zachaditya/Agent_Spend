@@ -40,6 +40,7 @@ def reset_database(path: Path) -> dict[str, Any]:
             funding_attempts = _delete_table(database, "funding_attempts")
             funding_events = _delete_table(database, "funding_events")
             purchases = _delete_table(database, "purchases")
+            offers = _delete_table(database, "offers")
             policy = _delete_table(database, "policy")
             wallet_creation = _delete_table(database, "wallet_creation")
             wallet = _delete_table(database, "wallet")
@@ -48,10 +49,12 @@ def reset_database(path: Path) -> dict[str, Any]:
             "wallet_creation_rows_deleted": wallet_creation,
             "policy_rows_deleted": policy,
             "purchase_rows_deleted": purchases,
+            "offer_rows_deleted": offers,
             "funding_event_rows_deleted": funding_events,
             "funding_attempt_rows_deleted": funding_attempts,
             "manual_follow_up": (
-                "Sweep any remaining shopper or merchant test USDC back to the treasury "
+                "Escrow balance is retained. Sweep shopper test USDC, including cashback, "
+                "and any merchant test USDC back to the treasury "
                 "manually, then restart the service and recreate/fund the shopper wallet."
             ),
         }

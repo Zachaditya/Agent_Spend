@@ -578,6 +578,58 @@ async def test_search_and_product_tools_delegate_to_store_with_price_parsing(
     assert detail["name"] == "ROOT CLASSIC TEE"
 
 
+async def test_purchase_uses_confirmed_weekly_increase_and_existing_spend(
+    purchase_service, service, database, cdp, store
+):
+    """Enforce the old budget before consent and the new budget afterward."""
+    database.insert_purchase(
+        product_id="prior-product", product_name="Prior purchase", amount_cents=2400,
+        status="CONFIRMED", reason_code="WITHIN_POLICY",
+        order_id="prior-order", payment_intent_id="prior-intent",
+    )
+    proposal = await service.set_spending_policy("38", "15")
+    assert proposal["status"] == "CONFIRMATION_REQUIRED"
+    rejected = await purchase_service.request_purchase("0591439009")
+    assert rejected["reason_code"] == "WEEKLY_LIMIT_EXCEEDED"
+    cdp.evm.get_account.return_value.transfer.assert_not_awaited()
+    assert store.cancelled == [rejected["payment_intent_id"]]
+
+    await service.set_spending_policy("38", "15", proposal["confirmation_id"])
+    paid = await purchase_service.request_purchase("0521471002")
+    assert paid["status"] == "CONFIRMED"
+    assert paid["reason_code"] == "WITHIN_POLICY"
+    cdp.evm.get_account.return_value.transfer.assert_awaited_once()
+    lookup = await service.get_spending_policy()
+    assert lookup["spent_this_week"] == "38.00"
+    assert lookup["remaining_this_week"] == "0.00"
+
+
+async def test_purchase_uses_confirmed_auto_increase_without_paying_pending_orders(
+    purchase_service, service, database, cdp
+):
+    """Use the raised auto ceiling for new requests while leaving pending orders unpaid."""
+    database.set_policy(2500, 1000)
+    proposal = await service.set_spending_policy("25", "14")
+    assert proposal["status"] == "CONFIRMATION_REQUIRED"
+    pending = await purchase_service.request_purchase("0591439009")
+    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["reason_code"] == "ABOVE_AUTO_LIMIT"
+    cdp.evm.get_account.return_value.transfer.assert_not_awaited()
+
+    await service.set_spending_policy("25", "14", proposal["confirmation_id"])
+    cdp.evm.get_account.return_value.transfer.assert_not_awaited()
+    assert database.get_pending_approvals()[0]["id"] == pending["purchase_id"]
+    paid = await purchase_service.request_purchase("0521471002")
+    assert paid["status"] == "CONFIRMED"
+    cdp.evm.get_account.return_value.transfer.assert_awaited_once()
+    lookup = await service.get_spending_policy()
+    assert lookup["max_auto_transaction"] == "14.00"
+    assert lookup["weekly_limit"] == "25.00"
+    assert lookup["spent_this_week"] == "14.00"
+    assert lookup["remaining_this_week"] == "11.00"
+    assert lookup["pending_approvals"][0]["id"] == pending["purchase_id"]
+
+
 def test_database_purchase_queries_drive_policy_lookup(database) -> None:
     """Persist purchase spend, pending approvals, duplicate windows, and history.
 

@@ -183,3 +183,34 @@ async def test_order_routes_send_agent_key_without_exposing_it() -> None:
         ("POST", "/agent/payment-intents/intent-1/confirm"),
         ("POST", "/agent/payment-intents/intent-1/cancel"),
     ]
+
+
+async def test_search_can_supply_one_hundred_candidates_for_offer_ranking():
+    """Keep late catalog results available for net-price ranking in the purchase service.
+
+    Args:
+        None.
+
+    Returns:
+        None. Store normalization does not truncate to the shopper's display limit.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Return a catalog page larger than the original ten-result cap.
+
+        Args:
+            request: Merchant search HTTP request.
+
+        Returns:
+            httpx.Response: Twelve valid catalog products.
+        """
+        return httpx.Response(
+            200,
+            json={"items": [{"id": str(n), "name": "Tee", "price_cents": 1200} for n in range(12)]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://shop.test"
+    ) as client:
+        store = StoreClient("https://shop.test", "secret", client=client)
+        assert len(await store.search_products("tee", 1500, 100)) == 12

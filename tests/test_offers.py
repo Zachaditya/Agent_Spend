@@ -2,7 +2,71 @@
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.policy import eligible
+
+
+def test_expiry_boundary_and_first_match() -> None:
+    """Keep expiry inclusive and prioritize expiry over other failing rules.
+
+    Args:
+        None.
+
+    Returns:
+        None. Assertions verify timestamps and deterministic rule ordering.
+    """
+    now = datetime.now(UTC)
+    assert eligible(offer(expires_at=now), False, 1200, now) == (True, 180, "15% cashback")
+    assert (
+        eligible(
+            offer(expires_at=now - timedelta(seconds=1), new_customer_only=1, budget_cents=0),
+            True,
+            1200,
+            now,
+        )[2]
+        == "Offer expired"
+    )
+    assert eligible(offer(new_customer_only=1, budget_cents=0), True, 1200, now)[2] == (
+        "Offer for new customers only"
+    )
+
+
+def test_offer_upsert_constraints_and_history(database) -> None:
+    """Persist one offer per product and count only other confirmed purchases.
+
+    Args:
+        database: Isolated SQLite repository.
+
+    Returns:
+        None. Assertions verify defaults, reconfiguration, and purchase exclusion.
+    """
+    expiry = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    first = database.upsert_offer("tee", 1500, False, 500, expiry)
+    database.add_offer_spend(first["id"], 180)
+    second = database.upsert_offer("tee", 1000, True, 600, expiry)
+    assert second["id"] == first["id"]
+    assert second["spent_cents"] == 0
+    assert database.get_offer("missing") is None
+    assert database.get_offer("tee")["new_customer_only"] == 1
+    assert not database.has_prior_purchase()
+    row = database.insert_purchase(
+        product_id="tee",
+        product_name="Tee",
+        amount_cents=1200,
+        status="SUBMITTED",
+        reason_code="WITHIN_POLICY",
+        order_id="o",
+        payment_intent_id="i",
+    )
+    assert not database.has_prior_purchase()
+    database.update_purchase(row["id"], status="CONFIRMED")
+    assert database.has_prior_purchase()
+    assert not database.has_prior_purchase(exclude_purchase_id=row["id"])
+    with pytest.raises((ValueError, __import__("sqlite3").IntegrityError)):
+        database.upsert_offer("bad", 5001, False, 500, expiry)
+    with pytest.raises(ValueError):
+        database.add_offer_spend(first["id"], 601)
 
 
 def offer(
@@ -46,7 +110,9 @@ def test_eligible_returns_no_cashback_without_offer() -> None:
     Returns:
         None. Assertions define the no-offer default.
     """
-    ok, cashback_cents, note = eligible(None, has_prior_purchase=False, amount_cents=1200, now=datetime.now(UTC))
+    ok, cashback_cents, note = eligible(
+        None, has_prior_purchase=False, amount_cents=1200, now=datetime.now(UTC)
+    )
 
     assert (ok, cashback_cents, note) == (False, 0, None)
 
@@ -129,4 +195,3 @@ def test_cashback_rounds_down_to_whole_cents() -> None:
         None. Assertions define basis-point integer math.
     """
     assert eligible(offer(), False, 1099, datetime.now(UTC)) == (True, 164, "15% cashback")
-

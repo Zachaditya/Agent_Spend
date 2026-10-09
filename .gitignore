@@ -11,3 +11,6 @@ __pycache__/
 .coverage
 htmlcov/
 docs/
+*.offer-funding.json
+*.offer-funding.json.tmp
+*.offer-funding.lock

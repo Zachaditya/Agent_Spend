@@ -2,12 +2,13 @@
 
 import asyncio
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.db import Database
-from app.policy import Decision, Policy, PurchaseContext, evaluate_purchase
+from app.policy import Decision, Policy, PurchaseContext, eligible, evaluate_purchase
 from app.store import StoreClient, StoreError
 from app.wallet import (
     NETWORK,
@@ -20,6 +21,46 @@ from app.wallet import (
 
 class PurchaseError(Exception):
     """Represent a sanitized purchase-loop failure suitable for MCP output."""
+
+
+def cashback_receipt_matches(
+    receipt: Any, token: str, sender: str, recipient: str, amount: int
+) -> bool:
+    """Verify the exact escrow-to-shopper USDC event in a successful receipt.
+
+    Args:
+        receipt: Web3 receipt mapping with status and ERC-20 event logs.
+        token: Configured USDC contract address.
+        sender: Escrow account address resolved by the provider.
+        recipient: Persisted shopper address.
+        amount: Expected reward in integer USDC base units.
+
+    Returns:
+        bool: True only when successful receipt evidence matches every transfer field.
+    """
+    if not isinstance(receipt, Mapping) or receipt.get("status") != 1:
+        return False
+    for log in receipt.get("logs", []):
+        try:
+            topics = [
+                bytes.fromhex(v.removeprefix("0x")) if isinstance(v, str) else bytes(v)
+                for v in log["topics"]
+            ]
+            data = log["data"]
+            value = int(data, 16) if isinstance(data, str) else int.from_bytes(data, "big")
+            if (
+                str(log["address"]).lower() == token.lower()
+                and len(topics) == 3
+                and topics[0].hex()
+                == "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                and topics[1] == bytes.fromhex(sender[2:].zfill(64))
+                and topics[2] == bytes.fromhex(recipient[2:].zfill(64))
+                and value == amount
+            ):
+                return True
+        except (KeyError, ValueError, TypeError):
+            continue
+    return False
 
 
 def parse_optional_price(max_price: Decimal | int | str | None) -> int | None:
@@ -62,6 +103,7 @@ class PurchaseService:
         merchant_address: str,
         usdc_contract_address: str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
         web3: Any | None = None,
+        escrow_account_name: str = "offer-escrow",
     ) -> None:
         """Bind persistence, merchant client, CDP account access, and chain reads.
 
@@ -72,6 +114,7 @@ class PurchaseService:
             merchant_address: Only allowed merchant recipient for purchases.
             usdc_contract_address: Base Sepolia USDC token contract address.
             web3: Optional Web3-compatible reader for balances and receipts.
+            escrow_account_name: Server-configured account funding cashback.
 
         Returns:
             None.
@@ -82,6 +125,7 @@ class PurchaseService:
         self.merchant_address = merchant_address
         self.usdc_contract_address = usdc_contract_address
         self.web3 = web3
+        self.escrow_account_name = escrow_account_name
 
     async def search_products(
         self, query: str, max_price: Decimal | int | str | None = None, limit: int = 5
@@ -101,7 +145,27 @@ class PurchaseService:
         """
         try:
             max_price_cents = parse_optional_price(max_price)
-            return await self.store.search_products(query, max_price_cents, limit)
+            products = await self.store.search_products(query, max_price_cents, 100)
+            prior = self.database.has_prior_purchase()
+            now = datetime.now(UTC)
+            ranked = []
+            for product in products:
+                cents = int(product["amount_cents"])
+                if max_price_cents is not None and cents > max_price_cents:
+                    continue
+                _, cashback, note = eligible(
+                    self.database.get_offer(product["product_id"]), prior, cents, now
+                )
+                ranked.append(
+                    {
+                        **product,
+                        "cashback": format_cents(cashback),
+                        "net_price": format_cents(cents - cashback),
+                        "offer_note": note,
+                    }
+                )
+            ranked.sort(key=lambda item: Decimal(item["net_price"]))
+            return ranked[: min(max(int(limit), 1), 10)]
         except StoreError as error:
             raise PurchaseError(str(error)) from None
 
@@ -367,7 +431,65 @@ class PurchaseService:
             )
             return self._decision_result(purchase, decision)
         purchase = self.database.update_purchase(purchase["id"], status="CONFIRMED")
+        purchase = await self.settle_cashback(purchase["id"])
         return self._decision_result(purchase, decision)
+
+    async def settle_cashback(self, purchase_id: str) -> dict[str, Any]:
+        """Pay one eligible reward after merchant confirmation, with no automatic retry.
+
+        Args:
+            purchase_id: Existing purchase UUID; offer, amount, and destination are
+                resolved exclusively from persisted server state.
+
+        Returns:
+            dict[str, Any]: Purchase row with terminal cashback outcome. Unknown
+            submission or receipt outcomes retain their hash and budget allocation.
+            A failed cashback never changes the confirmed merchant purchase.
+        """
+        purchase, claimed = self.database.claim_cashback(purchase_id, datetime.now(UTC))
+        if not claimed:
+            return purchase
+        try:
+            wallet = self.database.get_wallet()
+            if wallet is None:
+                raise PurchaseError("NO_WALLET")
+            escrow = await self.cdp.evm.get_account(name=self.escrow_account_name)
+            if escrow.address.lower() == wallet["address"].lower():
+                raise PurchaseError("ESCROW_MUST_BE_SEPARATE")
+        except Exception:
+            self.database.release_failed_cashback(purchase_id)
+            return self.database._purchase_with_datetime(purchase_id)
+        try:
+            tx_hash = str(
+                await escrow.transfer(
+                    to=wallet["address"],
+                    amount=cents_to_usdc_base_units(purchase["cashback_cents"]),
+                    token="usdc",
+                    network=NETWORK,
+                )
+            )
+            get_explorer_url(tx_hash)
+            self.database.record_cashback(
+                purchase_id, purchase["offer_id"], purchase["cashback_cents"], "FAILED", tx_hash
+            )
+            receipt = await self._wait_for_receipt(tx_hash)
+            status = self._receipt_status(receipt)
+            if status == 1 and cashback_receipt_matches(
+                receipt,
+                self.usdc_contract_address,
+                escrow.address,
+                wallet["address"],
+                cents_to_usdc_base_units(purchase["cashback_cents"]),
+            ):
+                self.database.record_cashback(
+                    purchase_id, purchase["offer_id"], purchase["cashback_cents"], "PAID", tx_hash
+                )
+            elif status == 0:
+                self.database.release_failed_cashback(purchase_id)
+        except Exception:
+            # No retry: the transfer may already exist even if its response was lost.
+            pass
+        return self.database._purchase_with_datetime(purchase_id)
 
     async def _wait_for_receipt(self, tx_hash: str, timeout: int = 60) -> Any:
         """Wait for the payment receipt using the configured Web3 reader.
@@ -452,6 +574,9 @@ class PurchaseService:
             "product_id": purchase["product_id"],
             "product_name": purchase["product_name"],
             "amount": format_cents(purchase["amount_cents"]),
+            "offer_note": purchase["offer_note"],
+            "cashback_tx_hash": None,
+            "cashback_explorer_url": None,
             "cashback_status": purchase["cashback_status"],
             "cashback": format_cents(purchase["cashback_cents"]),
         }
@@ -508,6 +633,9 @@ class PurchaseService:
             "reason_code": row["reason_code"],
             "order_id": row["order_id"],
             "payment_intent_id": row["payment_intent_id"],
+            "offer_note": row["offer_note"],
+            "cashback_tx_hash": None,
+            "cashback_explorer_url": None,
             "cashback_status": row["cashback_status"],
             "cashback": format_cents(row["cashback_cents"]),
             "created_at": row["created_at"],

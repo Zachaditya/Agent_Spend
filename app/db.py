@@ -1,10 +1,12 @@
-"""Persist wallet pointers, creation requests, and auditable funding events in SQLite."""
+"""Persist wallets, funding, policies, offers, and exactly-once cashback claims in SQLite."""
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from app.policy import eligible
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallet (
@@ -65,7 +67,21 @@ CREATE TABLE IF NOT EXISTS purchases (
     cashback_cents INTEGER NOT NULL DEFAULT 0,
     cashback_status TEXT NOT NULL DEFAULT 'NONE'
         CHECK (cashback_status IN ('NONE','PAID','NOT_ELIGIBLE','FAILED')),
-    cashback_tx_hash TEXT UNIQUE
+    cashback_tx_hash TEXT UNIQUE,
+    offer_note TEXT
+);
+"""
+
+OFFER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS offers (
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL UNIQUE,
+    cashback_bps INTEGER NOT NULL CHECK (cashback_bps BETWEEN 1 AND 5000),
+    new_customer_only INTEGER NOT NULL DEFAULT 0 CHECK (new_customer_only IN (0, 1)),
+    budget_cents INTEGER NOT NULL CHECK (budget_cents >= 0),
+    spent_cents INTEGER NOT NULL DEFAULT 0 CHECK (spent_cents >= 0 AND spent_cents <= budget_cents),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -108,6 +124,7 @@ class Database:
         self.connection.execute(ATTEMPT_SCHEMA)
         self.connection.execute(POLICY_SCHEMA)
         self._migrate_purchases()
+        self.connection.execute(OFFER_SCHEMA)
 
     def _migrate_funding_events(self) -> None:
         """Upgrade baseline funding rows transactionally without losing hashes.
@@ -162,6 +179,7 @@ class Database:
         self.connection.execute(PURCHASE_SCHEMA)
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(purchases)")}
         additions = {
+            "offer_note": "ALTER TABLE purchases ADD COLUMN offer_note TEXT",
             "offer_id": "ALTER TABLE purchases ADD COLUMN offer_id TEXT",
             "cashback_cents": (
                 "ALTER TABLE purchases ADD COLUMN cashback_cents INTEGER NOT NULL DEFAULT 0"
@@ -853,6 +871,216 @@ class Database:
         result = dict(row)
         result["created_at_datetime"] = datetime.fromisoformat(result["created_at"])
         return result
+
+    def upsert_offer(
+        self,
+        product_id: str,
+        cashback_bps: int,
+        new_customer_only: bool,
+        budget_cents: int,
+        expires_at: str,
+        *,
+        expected_offer: Any = ...,
+    ) -> dict[str, Any]:
+        """Create or replace a product offer while preserving its identity.
+
+        Args:
+            product_id: Merchant catalog identifier.
+            cashback_bps: Integer cashback rate between 1 and 5000 basis points.
+            new_customer_only: Explicit restriction; false includes returning customers.
+            budget_cents: New nonnegative budget; successful reconfiguration resets spend.
+            expires_at: Timezone-aware ISO expiry timestamp.
+            expected_offer: Optional pre-funding snapshot; rejects concurrent offer changes.
+
+        Returns:
+            dict[str, Any]: Persisted offer with zero spent cents.
+
+        Raises:
+            ValueError: Expiry is naive or an uncertain payout prevents a safe reset.
+            sqlite3.IntegrityError: Offer values violate database constraints.
+        """
+        expiry = datetime.fromisoformat(expires_at)
+        if expiry.tzinfo is None:
+            raise ValueError("Offer expiry requires a timezone")
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if expected_offer is not ... and self.get_offer(product_id) != expected_offer:
+                raise ValueError("Offer changed during funding; rerun after settlement")
+            if self.connection.execute(
+                "SELECT 1 FROM purchases WHERE product_id = ? "
+                "AND cashback_status = 'FAILED' AND cashback_cents > 0",
+                (product_id,),
+            ).fetchone():
+                raise ValueError("Offer has an unresolved cashback attempt; inspect its receipt")
+            self.connection.execute(
+                "INSERT INTO offers (id, product_id, cashback_bps, new_customer_only, "
+                "budget_cents, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(product_id) DO UPDATE SET cashback_bps=excluded.cashback_bps, "
+                "new_customer_only=excluded.new_customer_only, budget_cents=excluded.budget_cents, "
+                "spent_cents=0, expires_at=excluded.expires_at",
+                (
+                    str(uuid4()),
+                    product_id,
+                    cashback_bps,
+                    int(new_customer_only),
+                    budget_cents,
+                    expiry.astimezone(UTC).isoformat(),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        return self.get_offer(product_id)
+
+    def get_offer(self, product_id: str) -> dict[str, Any] | None:
+        """Read the single server-owned offer for a catalog product.
+
+        Args:
+            product_id: Merchant catalog identifier.
+
+        Returns:
+            dict[str, Any] | None: Offer row, or None when no offer exists.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM offers WHERE product_id = ?", (product_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def has_prior_purchase(self, exclude_purchase_id: str | None = None) -> bool:
+        """Check for confirmed purchase history, excluding the current purchase.
+
+        Args:
+            exclude_purchase_id: Optional current purchase UUID to ignore.
+
+        Returns:
+            bool: Whether any other confirmed purchase exists for the demo shopper.
+        """
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM purchases WHERE status = 'CONFIRMED' AND id != ? LIMIT 1",
+                (exclude_purchase_id or "",),
+            ).fetchone()
+            is not None
+        )
+
+    def add_offer_spend(self, offer_id: str, cashback_cents: int) -> None:
+        """Atomically consume budget without permitting negative or excessive spend.
+
+        Args:
+            offer_id: Persisted offer UUID.
+            cashback_cents: Nonnegative cents to consume.
+
+        Returns:
+            None. Existing caller transactions retain control of the commit.
+
+        Raises:
+            ValueError: Amount is negative or the offer cannot cover it.
+        """
+        if cashback_cents < 0:
+            raise ValueError("Cashback cannot be negative")
+        nested = self.connection.in_transaction
+        cursor = self.connection.execute(
+            "UPDATE offers SET spent_cents = spent_cents + ? "
+            "WHERE id = ? AND spent_cents + ? <= budget_cents",
+            (cashback_cents, offer_id, cashback_cents),
+        )
+        if not nested:
+            self.connection.commit()
+        if cursor.rowcount != 1:
+            raise ValueError("Offer budget used up")
+
+    def claim_cashback(self, purchase_id: str, now: datetime) -> tuple[dict[str, Any], bool]:
+        """Commit a one-time payout claim and its budget before any remote effect.
+
+        Args:
+            purchase_id: Merchant-confirmed purchase UUID.
+            now: Timezone-aware eligibility evaluation time.
+
+        Returns:
+            tuple[dict[str, Any], bool]: Current purchase and whether this caller owns
+            the payout. FAILED is a conservative terminal default until a receipt
+            proves PAID; a crash cannot reopen the claim or release uncertain spend.
+        """
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            purchase = self._purchase_with_datetime(purchase_id)
+            if purchase["status"] != "CONFIRMED" or purchase["cashback_status"] != "NONE":
+                return purchase, False
+            offer = self.get_offer(purchase["product_id"])
+            if offer is None:
+                return purchase, False
+            ok, cents, note = eligible(
+                offer, self.has_prior_purchase(purchase_id), purchase["amount_cents"], now
+            )
+            # A zero-cent result needs no on-chain transfer or receipt.
+            status = "FAILED" if ok and cents > 0 else "NOT_ELIGIBLE"
+            if ok and cents > 0:
+                self.add_offer_spend(offer["id"], cents)
+            self.connection.execute(
+                "UPDATE purchases SET offer_id=?, cashback_cents=?, cashback_status=?, "
+                "offer_note=? WHERE id=?",
+                (offer["id"], cents, status, note, purchase_id),
+            )
+        return self._purchase_with_datetime(purchase_id), ok and cents > 0
+
+    def record_cashback(
+        self,
+        purchase_id: str,
+        offer_id: str,
+        cashback_cents: int,
+        status: str,
+        tx_hash: str | None = None,
+    ) -> None:
+        """Record the outcome of an already claimed payout without consuming budget again.
+
+        Args:
+            purchase_id: Purchase UUID whose claim was persisted before submission.
+            offer_id: Offer UUID matching the claim.
+            cashback_cents: Cents matching the immutable claim.
+            status: PAID, FAILED, or NOT_ELIGIBLE outcome.
+            tx_hash: Optional public cashback hash, persisted before receipt waiting.
+
+        Returns:
+            None. Repeated terminal writes cannot reopen or overwrite a paid payout.
+
+        Raises:
+            ValueError: The outcome or claim does not match the persisted purchase.
+        """
+        if status not in {"PAID", "FAILED", "NOT_ELIGIBLE"}:
+            raise ValueError("Invalid cashback status")
+        if status == "PAID" and not tx_hash:
+            raise ValueError("Paid cashback requires a transaction hash")
+        with self.connection:
+            row = self._purchase_with_datetime(purchase_id)
+            if (row["offer_id"], row["cashback_cents"]) != (offer_id, cashback_cents):
+                raise ValueError("Cashback claim mismatch")
+            if row["cashback_status"] == "PAID":
+                return
+            self.connection.execute(
+                "UPDATE purchases SET cashback_status=?, "
+                "cashback_tx_hash=COALESCE(?, cashback_tx_hash) WHERE id=?",
+                (status, tx_hash, purchase_id),
+            )
+
+    def release_failed_cashback(self, purchase_id: str) -> None:
+        """Release a claim only after a definite no-transfer or reverted outcome.
+
+        Args:
+            purchase_id: Failed cashback purchase UUID.
+
+        Returns:
+            None. The terminal failure remains non-retryable with zero allocated cents.
+        """
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self._purchase_with_datetime(purchase_id)
+            if row["cashback_status"] != "FAILED" or not row["cashback_cents"]:
+                return
+            self.connection.execute(
+                "UPDATE offers SET spent_cents=spent_cents-? WHERE id=?",
+                (row["cashback_cents"], row["offer_id"]),
+            )
+            self.connection.execute(
+                "UPDATE purchases SET cashback_cents=0 WHERE id=?", (purchase_id,)
+            )
 
     def _table_exists(self, table_name: str) -> bool:
         """Check for an application table before querying future-phase contracts.

@@ -57,6 +57,9 @@ async def test_mcp_discovery_two_step_flow_and_host_validation(settings, cdp, ca
                 },
             )
             assert init.status_code == 200
+            assert "weekly budget or automatic purchase limit require fresh confirmation" in (
+                init.json()["result"]["instructions"]
+            )
             listed = await rpc(client, "tools/list", host=settings.public_host)
             assert listed.status_code == 200
             tools = {item["name"]: item for item in listed.json()["result"]["tools"]}
@@ -90,6 +93,9 @@ async def test_mcp_discovery_two_step_flow_and_host_validation(settings, cdp, ca
             assert "new message" in tools["create_agent_wallet"]["description"]
             assert "top-up" in tools["fund_agent_wallet"]["description"]
             assert "tighten" in tools["set_spending_policy"]["description"]
+            assert "automatic purchase limit increase" in (
+                tools["set_spending_policy"]["description"]
+            )
             assert "private key" in tools["get_wallet"]["description"]
             assert "product_id" in tools["request_purchase"]["description"]
             assert "max_price" in tools["search_products"]["inputSchema"]["properties"]
@@ -167,7 +173,33 @@ async def test_mcp_discovery_two_step_flow_and_host_validation(settings, cdp, ca
             assert (
                 tightened.json()["result"]["structuredContent"]["max_auto_transaction"] == "10.00"
             )
-            loosened = await rpc(
+            proposed = await rpc(
+                client,
+                "tools/call",
+                {
+                    "name": "set_spending_policy",
+                    "arguments": {"weekly_limit": "50", "max_auto_transaction": "10"},
+                },
+            )
+            proposal = proposed.json()["result"]["structuredContent"]
+            assert proposal["status"] == "CONFIRMATION_REQUIRED"
+            before = await rpc(client, "tools/call", {"name": "get_spending_policy"})
+            assert before.json()["result"]["structuredContent"]["weekly_limit"] == "25.00"
+            increase_args = {
+                "name": "set_spending_policy",
+                "arguments": {
+                    "weekly_limit": "50", "max_auto_transaction": "10",
+                    "confirmation_id": proposal["confirmation_id"],
+                },
+            }
+            increased = await rpc(client, "tools/call", increase_args)
+            assert increased.json()["result"]["structuredContent"] == {
+                "status": "ACTIVE", "weekly_limit": "50.00", "max_auto_transaction": "10.00",
+            }
+            replay = await rpc(client, "tools/call", increase_args)
+            assert replay.json()["result"]["isError"] is True
+            assert "CONFIRMATION_EXPIRED" in replay.text
+            over_cap = await rpc(
                 client,
                 "tools/call",
                 {
@@ -175,9 +207,41 @@ async def test_mcp_discovery_two_step_flow_and_host_validation(settings, cdp, ca
                     "arguments": {"weekly_limit": "500", "max_auto_transaction": "10"},
                 },
             )
-            assert loosened.json()["result"]["structuredContent"]["status"] == (
-                "LOOSENING_NOT_ALLOWED"
+            assert over_cap.json()["result"]["structuredContent"]["status"] == "ABOVE_CAP"
+            auto_increase = await rpc(
+                client, "tools/call",
+                {
+                    "name": "set_spending_policy",
+                    "arguments": {"weekly_limit": "50", "max_auto_transaction": "11"},
+                },
             )
+            auto_proposal = auto_increase.json()["result"]["structuredContent"]
+            assert auto_proposal["status"] == "CONFIRMATION_REQUIRED"
+            before_auto = await rpc(client, "tools/call", {"name": "get_spending_policy"})
+            assert before_auto.json()["result"]["structuredContent"][
+                "max_auto_transaction"
+            ] == "10.00"
+            confirmed_auto = await rpc(
+                client, "tools/call",
+                {
+                    "name": "set_spending_policy",
+                    "arguments": {
+                        "weekly_limit": "50", "max_auto_transaction": "11",
+                        "confirmation_id": auto_proposal["confirmation_id"],
+                    },
+                },
+            )
+            assert confirmed_auto.json()["result"]["structuredContent"] == {
+                "status": "ACTIVE", "weekly_limit": "50.00", "max_auto_transaction": "11.00",
+            }
+            auto_over_cap = await rpc(
+                client, "tools/call",
+                {
+                    "name": "set_spending_policy",
+                    "arguments": {"weekly_limit": "100", "max_auto_transaction": "50.01"},
+                },
+            )
+            assert auto_over_cap.json()["result"]["structuredContent"]["status"] == "ABOVE_CAP"
             assert (await rpc(client, "tools/list", host="attacker.example")).status_code == 421
             assert (
                 await rpc(client, "tools/list", host=settings.public_host + ".evil")

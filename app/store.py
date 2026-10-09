@@ -153,7 +153,7 @@ class StoreClient:
         Raises:
             StoreError: Both semantic and fallback catalog searches fail.
         """
-        bounded_limit = min(max(int(limit), 1), 10)
+        bounded_limit = min(max(int(limit), 1), 100)
         raw_items = await self._search_semantic_then_name(query)
         products = []
         for item in raw_items:

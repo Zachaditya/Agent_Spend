@@ -108,7 +108,7 @@ def evaluate_purchase(context: PurchaseContext) -> PurchaseDecision:
 def validate_policy_change(
     current: Policy | None, weekly_limit_cents: int, max_auto_tx_cents: int
 ) -> PolicyChangeDecision:
-    """Validate initial policy creation, stricter updates, caps, and malformed limits.
+    """Validate mutable weekly and automatic limits against their server caps.
 
     Args:
         current: Existing active policy, or None when creating the first one.
@@ -120,11 +120,6 @@ def validate_policy_change(
     """
     if weekly_limit_cents < 0 or max_auto_tx_cents < 0 or max_auto_tx_cents > weekly_limit_cents:
         return PolicyChangeDecision(False, DecisionReason.INVALID_POLICY)
-    if current is not None and (
-        weekly_limit_cents > current.weekly_limit_cents
-        or max_auto_tx_cents > current.max_auto_tx_cents
-    ):
-        return PolicyChangeDecision(False, DecisionReason.LOOSENING_NOT_ALLOWED)
     if weekly_limit_cents > MAX_WEEKLY_LIMIT_CENTS or max_auto_tx_cents > MAX_AUTO_TX_CENTS:
         return PolicyChangeDecision(False, DecisionReason.ABOVE_CAP)
     return PolicyChangeDecision(True, DecisionReason.WITHIN_POLICY)
@@ -148,3 +143,30 @@ def _is_duplicate_product_request(
         if prior_product_id == product_id and timedelta(0) <= age <= DUPLICATE_PURCHASE_WINDOW:
             return True
     return False
+
+
+def eligible(
+    offer: dict | None, has_prior_purchase: bool, amount_cents: int, now: datetime
+) -> tuple[bool, int, str | None]:
+    """Evaluate expiry, optional customer restriction, and remaining cashback budget.
+
+    Args:
+        offer: Server-owned offer row, or None for a product without an offer.
+        has_prior_purchase: Whether another confirmed purchase exists.
+        amount_cents: Full merchant price in integer cents.
+        now: Timezone-aware evaluation time; expiry is inclusive.
+
+    Returns:
+        tuple[bool, int, str | None]: Eligibility, rounded-down cashback cents,
+        and the first applicable explanation. This never changes spending policy.
+    """
+    if offer is None:
+        return False, 0, None
+    if now > datetime.fromisoformat(offer["expires_at"]):
+        return False, 0, "Offer expired"
+    if offer["new_customer_only"] and has_prior_purchase:
+        return False, 0, "Offer for new customers only"
+    cashback = amount_cents * offer["cashback_bps"] // 10_000
+    if cashback > offer["budget_cents"] - offer["spent_cents"]:
+        return False, 0, "Offer budget used up"
+    return True, cashback, f"{offer['cashback_bps'] / 100:g}% cashback"

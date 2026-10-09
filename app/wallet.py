@@ -941,7 +941,7 @@ class WalletService:
         return {"status": reason.value, "reason_code": reason.value}
 
     def _policy_disclosure(self, weekly_limit_cents: int, max_auto_tx_cents: int) -> str:
-        """Describe the first policy setup before any durable side effect occurs.
+        """Describe policy setup or a limit increase before any durable change.
 
         Args:
             weekly_limit_cents: Requested weekly budget in cents.
@@ -954,7 +954,9 @@ class WalletService:
             "Agent Spend will set a spending policy for this Base Sepolia shopping wallet: "
             f"weekly limit {format_cents(weekly_limit_cents)} test USDC and automatic "
             f"approval for purchases up to {format_cents(max_auto_tx_cents)} test USDC. "
-            "The agent can later make these limits stricter but cannot raise them from chat. "
+            "Weekly and automatic approval limits can be raised within server caps "
+            "after a new confirmation. Changes that only lower limits apply immediately. "
+            "Existing purchases still count toward the rolling seven-day budget. "
             "Reply yes to set this spending policy."
         )
 
@@ -974,20 +976,25 @@ class WalletService:
         }
 
     def _policy_confirmation_params(
-        self, weekly_limit_cents: int, max_auto_tx_cents: int
-    ) -> dict[str, int]:
-        """Build the immutable parameter set bound to the first policy confirmation.
+        self,
+        weekly_limit_cents: int,
+        max_auto_tx_cents: int,
+        current_policy: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Bind requested limits and the current policy revision to confirmation.
 
         Args:
             weekly_limit_cents: Requested weekly budget in whole cents.
             max_auto_tx_cents: Requested automatic transaction limit in whole cents.
+            current_policy: Persisted policy snapshot, including its update timestamp.
 
         Returns:
-            dict[str, int]: Canonical cents values for confirmation hashing.
+            dict[str, Any]: Canonical limits and baseline for confirmation hashing.
         """
         return {
             "weekly_limit_cents": weekly_limit_cents,
             "max_auto_tx_cents": max_auto_tx_cents,
+            "current_policy": current_policy,
         }
 
     async def set_spending_policy(
@@ -996,7 +1003,7 @@ class WalletService:
         max_auto_transaction: Decimal | int | str,
         confirmation_id: str | None = None,
     ) -> dict[str, str]:
-        """Create the first policy with confirmation and apply tightening instantly.
+        """Confirm setup and increases to either limit, and apply tightening instantly.
 
         Args:
             weekly_limit: Requested weekly budget as a decimal amount of test USDC.
@@ -1013,8 +1020,10 @@ class WalletService:
         max_auto_tx_cents = self._parse_policy_amount(max_auto_transaction)
         if weekly_limit_cents is None or max_auto_tx_cents is None:
             return self._policy_rejection(DecisionReason.INVALID_POLICY)
-        params = self._policy_confirmation_params(weekly_limit_cents, max_auto_tx_cents)
         async with self._policy_lock:
+            params = self._policy_confirmation_params(
+                weekly_limit_cents, max_auto_tx_cents, self.database.get_policy()
+            )
             if confirmation_id is not None:
                 self.confirmations.consume_confirmation(
                     confirmation_id, "set_spending_policy", params
@@ -1023,7 +1032,12 @@ class WalletService:
             validation = validate_policy_change(current, weekly_limit_cents, max_auto_tx_cents)
             if not validation.allowed:
                 return self._policy_rejection(validation.reason)
-            if current is None and confirmation_id is None:
+            needs_confirmation = (
+                current is None
+                or weekly_limit_cents > current.weekly_limit_cents
+                or max_auto_tx_cents > current.max_auto_tx_cents
+            )
+            if needs_confirmation and confirmation_id is None:
                 return {
                     "status": "CONFIRMATION_REQUIRED",
                     "confirmation_id": self.confirmations.create_confirmation(

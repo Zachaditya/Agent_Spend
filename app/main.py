@@ -160,6 +160,7 @@ def create_app(
                 merchant_address=config.merchant_address,
                 usdc_contract_address=config.usdc_contract_address,
                 web3=wallet_service.web3,
+                escrow_account_name=config.escrow_account_name,
             )
             application.state.wallet_service = wallet_service
             application.state.store_client = store_client

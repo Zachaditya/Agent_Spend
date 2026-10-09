@@ -139,16 +139,19 @@ def build_mcp(service_provider: Callable[[], WalletService]) -> MCPServer:
         max_auto_transaction: str,
         confirmation_id: str | None = None,
     ) -> dict[str, object]:
-        """Set the initial policy with consent, then allow only stricter chat updates.
+        """Set a policy or raise either spending limit with consent; tighten immediately.
 
         On CONFIRMATION_REQUIRED, show disclosure word for word and ask yes or no.
         Call again with the confirmation ID only after the user says yes in a new
         message. Use decimal-string test USDC amounts such as "25" and "12".
-        The first policy must be within server caps and has no side effect until
-        confirmed. After a policy is active, stricter weekly or automatic limits
-        tighten the policy immediately without confirmation. Never retry, split, or rephrase a
-        refused increase; relay LOOSENING_NOT_ALLOWED, INVALID_POLICY, and ABOVE_CAP
-        exactly. Funding the wallet never raises this policy.
+        Initial setup and every weekly budget or automatic purchase limit increase
+        require fresh confirmation within server caps. Preserve any limit the user
+        did not ask to change. The automatic limit must not exceed the weekly limit.
+        Changes that only tighten limits apply immediately. If either limit increases,
+        no part of the update takes effect before confirmation. Existing purchases
+        still count toward the rolling seven-day budget. Relay INVALID_POLICY and
+        ABOVE_CAP exactly. Never retry, split, or rephrase a refused change to bypass
+        these rules. Funding the wallet never raises this policy.
 
         Args:
             weekly_limit: Requested weekly budget as a decimal test USDC string.
@@ -201,7 +204,8 @@ def build_mcp(service_provider: Callable[[], WalletService]) -> MCPServer:
         """Search eshop products with optional server-side max-price filtering.
 
         Show product_id, name, price, color, category, cashback, net_price, and
-        offer_note. In Phase 5 cashback is always 0.00 and net_price equals price.
+        offer_note. Never promise cashback unless the tool result shows it. Relay
+        offer_note when an offer does not apply; offers are applied by the server.
         Pass short product terms such as "tee" or "sweater". Do not invent product
         IDs. When the user asks for the best deal, compare net_price. Never accept
         amount, destination, payment, offer, or cashback inputs.
@@ -263,6 +267,9 @@ def build_mcp(service_provider: Callable[[], WalletService]) -> MCPServer:
         submitted purchase or claim that no funds moved. Show its transaction link
         when present and request developer recovery of the existing intent.
 
+        Only cashback_status PAID means cashback was received. FAILED is not retried;
+        an uncertain transfer may retain its amount and hash for receipt inspection.
+
         Args:
             product_id: Store-owned product identifier to buy.
             max_price: Optional maximum test USDC price as a decimal string.
@@ -287,6 +294,9 @@ def build_mcp(service_provider: Callable[[], WalletService]) -> MCPServer:
         Basescan link. Rejected purchases show reason_code. Pending purchases are
         unpaid. Cashback fields are NONE and 0.00 until Phase 5B. This is read-only
         and is the only history tool exposed to ChatGPT.
+
+        Only cashback_status PAID means cashback was received. FAILED is not retried;
+        an uncertain transfer may retain its amount and hash for receipt inspection.
 
         Args:
             limit: Maximum number of recent purchases to return, capped by the server.
@@ -313,8 +323,10 @@ def build_mcp(service_provider: Callable[[], WalletService]) -> MCPServer:
             "Funding accepts user-requested USDC amounts within server caps; every top-up requires "
             "fresh confirmation. The server controls treasury, token, network, wallet, "
             "and gas ETH. "
-            "Policy setup requires a first confirmation; later chat updates can only tighten "
-            "weekly and automatic transaction limits. "
+            "Policy setup and increases to either the weekly budget or automatic purchase "
+            "limit require fresh confirmation within server caps. Changes that only lower "
+            "limits apply immediately. The automatic limit cannot exceed the weekly limit. "
+            "Policy changes preserve purchase history and do not pay pending purchases. "
             "Coinbase CDP holds the keys; no tool can export private keys or seed phrases. "
             "Product search and purchases use merchant-owned product IDs. Purchase tools never "
             "accept amounts, recipients, offers, cashback values, or networks."
